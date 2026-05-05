@@ -135,3 +135,9 @@ python main.py --dataset oi --img_folder data/oi/images/ --ann_path data/oi/ --e
 # 3. Questions
 Since the code is cleaned up from the draft, there may be some errors.
 If you meet any problem when running our code, please let me know! (It's better open an issue so that anyone can see it)
+
+
+
+```
+python3 inference.py --output_folder /mnt/sda1/Datasets/hl_dataset/scene_graphs/ --img_folder /mnt/sda1/Datasets/hl_dataset/train --ignore_files --resume /mnt/sda1/Models/RelTR/checkpoint0149.pth
+```

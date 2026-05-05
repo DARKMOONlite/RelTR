@@ -1,6 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # Copyright (c) Institute of Information Processing, Leibniz University Hannover.
 import argparse
+import cProfile
+import pstats
 from PIL import Image
 import matplotlib.pyplot as plt
 import json
@@ -54,14 +56,18 @@ def rescale_bboxes(out_bbox, size):
     return b
 
 
-def load_and_infer(args):
-    """Load model and run inference, returning the top-k filtered results."""
+def load_model(args):
+    """Load model once and return it."""
     model, _, _ = build_model(args)
     ckpt = torch.load(args.resume)
     model.load_state_dict(ckpt['model'])
     model.eval()
+    return model
 
-    im = Image.open(args.img_path).convert('RGB')
+
+def infer(model, args,image):
+    """Run inference on a single image using an already-loaded model."""
+    im = Image.open(image).convert('RGB')
     img = transform(im).unsqueeze(0)
     outputs = model(img)
 
@@ -81,7 +87,7 @@ def load_and_infer(args):
                             * probas_obj[keep_queries].max(-1)[0])[:10]
     keep_queries = keep_queries[indices]
 
-    return model, im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled, keep
+    return im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled, keep
 
 
 def get_args_parser():
@@ -162,21 +168,39 @@ def bbox_iou(a, b):
 REQUIRED_IOU_THRESHOLD = 0.3
 
 
-def main(args):
-    model, im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled, keep = load_and_infer(args)
+def average_bbox(b1, b2):
+    """Average two [x1,y1,x2,y2] boxes."""
+    return [(b1[0] + b2[0]) / 2, (b1[1] + b2[1]) / 2, (b1[2] + b2[2]) / 2, (b1[3] + b2[3]) / 2]
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+def collect_images(root_dir, depth):
+    """Collect image paths up to `depth` folder levels deep (1 = root only)."""
+    images = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        rel = os.path.relpath(dirpath, root_dir)
+        level = 0 if rel == '.' else rel.count(os.sep) + 1
+        if level >= depth:
+            dirnames.clear()  # don't recurse beyond requested depth
+        for f in sorted(filenames):
+            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
+                images.append(os.path.join(dirpath, f))
+    return sorted(images)
+
+
+def main(model, args,image):
+    im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled, keep = infer(model, args,image)
 
     # Stores (label, bbox_tensor) for each registered object
-    object_registry = []
+    object_registry = [] # List of tuples: (label, bbox_list) for each registered object
     objects = []
     attributes = []
     relationships = {}  # Use dict to prevent duplicates: key = (subject, predicate, object)
 
 
 
-    def get_or_create_object(label, bbox):
+    def get_or_create_object(label:str, bbox:torch.Tensor):
         bbox_list = bbox.tolist()
-        print(f"\n--- Processing: {label}")
-        print(f"    Bbox: {bbox_list}")
         
         for idx, (reg_label, reg_bbox) in enumerate(object_registry):
             if reg_label == label:
@@ -186,22 +210,26 @@ def main(args):
                 print(f"      IoU: {iou:.4f} (threshold: {REQUIRED_IOU_THRESHOLD})")
                 if iou > REQUIRED_IOU_THRESHOLD:
                     print(f"    ✓ Reusing existing object {idx}")
+                    # object_registry[idx] = (reg_label, average_bbox(reg_bbox, bbox_list))  # Update with average bbox
                     return idx
                 else:
                     print(f"    ✗ IoU too low, will create new object")
         
         object_idx = len(objects)
         print(f"    → Creating new object {object_idx}")
-        objects.append({"name": label})
+        objects.append({"name": label,"bbox": [round(coord, 2) for coord in bbox_list]})
         object_registry.append((label, bbox_list))
         return object_idx
+
+
+
 
     for idx in keep_queries:
         # Find the correct position in the filtered bbox arrays
         # by counting how many True values appear before this index in 'keep'
         idx_in_kept = keep[:idx].sum().item()
-        sub_idx = get_or_create_object(CLASSES[probas_sub[idx].argmax()], sub_bboxes_scaled[idx_in_kept])
-        obj_idx = get_or_create_object(CLASSES[probas_obj[idx].argmax()], obj_bboxes_scaled[idx_in_kept])
+        sub_idx:int = get_or_create_object(CLASSES[probas_sub[idx].argmax()], sub_bboxes_scaled[idx_in_kept])
+        obj_idx:int = get_or_create_object(CLASSES[probas_obj[idx].argmax()], obj_bboxes_scaled[idx_in_kept])
         predicate = REL_CLASSES[probas[idx].argmax()]
         
         # Use tuple as key to prevent duplicate triplets
@@ -216,7 +244,7 @@ def main(args):
     # Convert relationships dict to list for JSON output
     relationships_list = list(relationships.values())
     
-    return {"url": args.img_path, "objects": objects, "attributes": attributes, "relationships": relationships_list}
+    return {"url": image, "objects": objects, "attributes": attributes, "relationships": relationships_list}
 
 
 def save_scene_graph_json(scene_graph, filepath):
@@ -242,8 +270,8 @@ def print_scene_graph(scene_graph):
     print(f"{'='*60}\n")
 
 
-def visualize_old_style(args):
-    model, im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled = load_and_infer(args)
+def visualize_old_style(model, args):
+    im, img, probas, probas_sub, probas_obj, keep_queries, indices, sub_bboxes_scaled, obj_bboxes_scaled, keep = infer(model, args)
 
     conv_features, dec_attn_weights_sub, dec_attn_weights_obj = [], [], []
     hooks = [
@@ -321,61 +349,30 @@ def compare_filenames(folder1, folder2):
     }
 
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
-
-def collect_images(root_dir, depth):
-    """Collect image paths up to `depth` folder levels deep (1 = root only)."""
-    images = []
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        rel = os.path.relpath(dirpath, root_dir)
-        level = 0 if rel == '.' else rel.count(os.sep) + 1
-        if level >= depth:
-            dirnames.clear()  # don't recurse beyond requested depth
-        for f in sorted(filenames):
-            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS:
-                images.append(os.path.join(dirpath, f))
-    return sorted(images)
-
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('RelTR inference', parents=[get_args_parser()])
-    parser.add_argument('--output_folder', type=str, default="",
-                        help="Path to save scene graph as JSON")
-    parser.add_argument('--visualize', action='store_true',
-                        help="Show old-style visualization instead of scene graph")
-    parser.add_argument('--img_folder',type=str, default=None,
-                        help="Path to a folder containing multiple images to process (overrides --img_path)")
-    parser.add_argument('--depth', type=int, default=1,
-                        help="When comparing folders, how many levels of subdirectories to traverse (default: 1, meaning only the specified folder and not its subfolders)")
-    parser.add_argument('--ignore_files', action='store_true', default=False,
-                        help="When comparing folders, ignore files that are shared between them")
-    
-    args = parser.parse_args()
-    
+def run(args):
     if not args.visualize:
         os.makedirs(args.output_folder, exist_ok=True)
-    
+
     if args.img_path is None and args.img_folder is None:
         print("Error: Please provide either --img_path, --img_folder, or --compare_folders")
         exit(1)
-    
 
-    
+    model = load_model(args)
+
     if args.img_path: # Process a single image
         if args.visualize:
-            visualize_old_style(args)
+            visualize_old_style(model, args)
         else:
-            scene_graph = main(args)
+            scene_graph = main(model, args,args.img_path)
             print_scene_graph(scene_graph)
 
             base_name = os.path.splitext(os.path.basename(args.img_path))[0]
             base_name = os.path.join(args.output_folder, base_name)
             save_scene_graph_json(scene_graph, f"{base_name}_scene_graph.json")
-            
-            
+
     if args.img_folder: # Process all images in the specified folder
         file_list = collect_images(args.img_folder, args.depth)
+        # file_list = os.listdir(args.img_folder)
         if args.ignore_files:
             print(f"Comparing files in '{args.img_folder}' with '{args.output_folder}' to ignore shared files...")
             comparison = compare_filenames(args.img_folder, args.output_folder)
@@ -393,12 +390,43 @@ if __name__ == '__main__':
                         continue
                 img_path = os.path.join(args.img_folder, filename)
                 print(f"\nProcessing file: {img_path}")
-                args.img_path = img_path
-                scene_graph = main(args)
+                
+                scene_graph = main(model, args,img_path)
                 print_scene_graph(scene_graph)
 
                 base_name = os.path.join(args.output_folder, os.path.splitext(filename)[0])
-                save_scene_graph_json(scene_graph, f"{base_name}.json")    
+                if args.test:
+                    print(f"Test mode enabled, not saving JSON for {filename}")
+                    return
+                save_scene_graph_json(scene_graph, f"{base_name}.json")
             except Exception as e:
                 print(f"Error processing {filename}: {e}, skipping this file.")
                 save_scene_graph_json({"url": img_path, "error": str(e)}, f"{os.path.join(args.output_folder, os.path.splitext(filename)[0])}.json")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('RelTR inference', parents=[get_args_parser()])
+    parser.add_argument('--output_folder', type=str, default="",
+                        help="Path to save scene graph as JSON")
+    parser.add_argument('--visualize', action='store_true',
+                        help="Show old-style visualization instead of scene graph")
+    parser.add_argument('--img_folder',type=str, default=None,
+                        help="Path to a folder containing multiple images to process (overrides --img_path)")
+    parser.add_argument('--depth', type=int, default=1,
+                        help="When comparing folders, how many levels of subdirectories to traverse (default: 1, meaning only the specified folder and not its subfolders)")
+    parser.add_argument('--ignore_files', action='store_true', default=False,
+                        help="When comparing folders, ignore files that are shared between them")
+    parser.add_argument("--test", action='store_true', help="Run a quick test with a single image to verify setup")
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        profiler = cProfile.Profile()
+        profiler.enable()
+
+    run(args)
+    if args.test:
+        profiler.disable()
+        stats = pstats.Stats(profiler)
+        stats.sort_stats('cumulative')
+        stats.print_stats(30)
