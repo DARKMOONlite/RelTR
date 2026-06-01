@@ -53,7 +53,7 @@ conda activate reltr
 
 # install packages
 conda install pytorch==1.6.0 torchvision==0.7.0 cudatoolkit=10.1 -c pytorch
-conda install matplotlib
+conda install matplotlib scipy tqdm
 ```
 
 ## Training/Evaluation on Visual Genome or Open Images V6
@@ -61,7 +61,6 @@ If you want to **train/evaluate** RelTR on Visual Genome, you need a little more
 
 a) Scipy (we used 1.5.2) and pycocotools are required. 
 ```
-conda install scipy
 pip install -U 'git+https://github.com/cocodataset/cocoapi.git#subdirectory=PythonAPI'
 ```
 b) Follow [README](https://github.com/yrcong/RelTR/blob/main/data/README.md) in the data directory to prepare the datasets.
